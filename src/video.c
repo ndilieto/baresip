@@ -1,12 +1,16 @@
 /**
  * @file src/video.c  Video stream
  *
- * Copyright (C) 2010 Creytiv.com
+ * Copyright (C) 2010 Alfred E. Heggestad
+ * Copyright (C) 2021 by:
+ *     Media Magic Technologies <developer@mediamagictechnologies.com>
+ *     and Divus GmbH <developer@divus.eu>
  *
  * \ref GenericVideoStream
  */
 #include <string.h>
 #include <stdlib.h>
+#include <re_atomic.h>
 #include <re.h>
 #include <rem.h>
 #include <baresip.h>
@@ -20,11 +24,13 @@
 
 /** Video transmit parameters */
 enum {
-	MEDIA_POLL_RATE = 250,                 /**< in [Hz]             */
-	BURST_MAX       = 8192,                /**< in bytes            */
-	RTP_PRESZ       = 4 + RTP_HEADER_SIZE, /**< TURN and RTP header */
-	RTP_TRAILSZ     = 12 + 4,              /**< SRTP/SRTCP trailer  */
-	PICUP_INTERVAL  = 500,
+	MEDIA_POLL_RATE = 250,		       /**< in [Hz]                  */
+	RTP_PRESZ	= 4 + RTP_HEADER_SIZE, /**< TURN and RTP header      */
+	RTP_TRAILSZ	= 12 + 4,	       /**< SRTP/SRTCP trailer       */
+	PICUP_INTERVAL	= 500,		       /**< FIR/PLI interval         */
+	NACK_BLPSZ	= 16,		       /**< NACK bitmask size        */
+	NACK_QUEUE_TIME	= 500,		       /**< in [ms]                  */
+	PKT_SIZE	= 1280,		       /**< max. Packet size in bytes*/
 };
 
 
@@ -77,12 +83,13 @@ struct vtx {
 	struct videnc_state *enc;          /**< Video encoder state       */
 	struct vidsrc_prm vsrc_prm;        /**< Video source parameters   */
 	struct vidsz vsrc_size;            /**< Video source size         */
+	struct vidsrc *vs;                 /**< Video source module       */
 	struct vidsrc_st *vsrc;            /**< Video source              */
-	struct lock *lock_enc;             /**< Lock for encoder          */
+	mtx_t *lock_enc;                   /**< Lock for encoder          */
 	struct vidframe *frame;            /**< Source frame              */
-	struct lock *lock_tx;              /**< Protect the sendq         */
+	mtx_t *lock_tx;                    /**< Protect the sendq         */
 	struct list sendq;                 /**< Tx-Queue (struct vidqent) */
-	struct tmr tmr_rtp;                /**< Timer for sending RTP     */
+	struct list sendqnb;               /**< Tx-Queue NACK wait buffer */
 	unsigned skipc;                    /**< Number of frames skipped  */
 	struct list filtl;                 /**< Filters in encoding order */
 	enum vidfmt fmt;                   /**< Outgoing pixel format     */
@@ -93,6 +100,9 @@ struct vtx {
 	double efps;                       /**< Estimated frame-rate      */
 	uint64_t ts_base;                  /**< First RTP timestamp sent  */
 	uint64_t ts_last;                  /**< Last RTP timestamp sent   */
+	thrd_t thrd;                       /**< Tx-Thread                 */
+	RE_ATOMIC bool run;                /**< Tx-Thread is active       */
+	cnd_t wait;                        /**< Tx-Thread wait            */
 
 	/** Statistics */
 	struct {
@@ -122,8 +132,9 @@ struct vrx {
 	const struct vidcodec *vc;         /**< Current video decoder     */
 	struct viddec_state *dec;          /**< Video decoder state       */
 	struct vidisp_prm vidisp_prm;      /**< Video display parameters  */
+	struct vidisp *vd;                 /**< Video display module      */
 	struct vidisp_st *vidisp;          /**< Video display             */
-	struct lock *lock;                 /**< Lock for decoder          */
+	mtx_t lock;                        /**< Lock for decoder          */
 	struct list filtl;                 /**< Filters in decoding order */
 	struct tmr tmr_picup;              /**< Picture update timer      */
 	struct vidsz size;                 /**< Incoming video resolution */
@@ -152,7 +163,6 @@ struct video {
 	struct vtx vtx;         /**< Transmit/encoder direction           */
 	struct vrx vrx;         /**< Receive/decoder direction            */
 	struct tmr tmr;         /**< Timer for frame-rate estimation      */
-	bool started;           /**< True if video is started             */
 	char *peer;             /**< Peer URI                             */
 	bool nack_pli;          /**< Send NACK/PLI to peer                */
 	video_err_h *errh;      /**< Error handler                        */
@@ -162,15 +172,18 @@ struct video {
 
 struct vidqent {
 	struct le le;
-	struct sa dst;
+	bool ext;
 	bool marker;
 	uint8_t pt;
 	uint32_t ts;
+	uint64_t jfs_nack;
+	uint16_t seq;
 	struct mbuf *mb;
 };
 
 
 static void request_picture_update(struct vrx *vrx);
+static void video_stop_source(struct video *v);
 
 
 static void vidqent_destructor(void *arg)
@@ -182,11 +195,12 @@ static void vidqent_destructor(void *arg)
 }
 
 
-static int vidqent_alloc(struct vidqent **qentp,
+static int vidqent_alloc(struct vidqent **qentp, struct stream *strm,
 			 bool marker, uint8_t pt, uint32_t ts,
 			 const uint8_t *hdr, size_t hdr_len,
 			 const uint8_t *pld, size_t pld_len)
 {
+	struct bundle *bun = stream_bundle(strm);
 	struct vidqent *qent;
 	int err = 0;
 
@@ -197,6 +211,7 @@ static int vidqent_alloc(struct vidqent **qentp,
 	if (!qent)
 		return ENOMEM;
 
+	qent->ext    = false;
 	qent->marker = marker;
 	qent->pt     = pt;
 	qent->ts     = ts;
@@ -208,6 +223,36 @@ static int vidqent_alloc(struct vidqent **qentp,
 	}
 
 	qent->mb->pos = qent->mb->end = RTP_PRESZ;
+
+	if (bundle_state(bun) != BUNDLE_NONE) {
+
+		const char *mid = stream_mid(strm);
+		size_t ext_len = 0;
+		size_t start = qent->mb->pos;
+		size_t pos;
+
+		/* skip the extension header */
+		qent->mb->pos = start + RTPEXT_HDR_SIZE;
+
+		pos = qent->mb->pos;
+
+		rtpext_encode(qent->mb, bundle_extmap_mid(bun),
+			      str_len(mid), (void *)mid);
+
+		ext_len = qent->mb->pos - pos;
+
+		/* write the Extension header at the beginning */
+		qent->mb->pos = start;
+
+		err = rtpext_hdr_encode(qent->mb, ext_len);
+		if (err)
+			goto out;
+
+		qent->mb->pos = start + RTPEXT_HDR_SIZE + ext_len;
+		qent->mb->end = start + RTPEXT_HDR_SIZE + ext_len;
+
+		qent->ext = true;
+	}
 
 	if (hdr)
 		(void)mbuf_write_mem(qent->mb, hdr, hdr_len);
@@ -226,94 +271,42 @@ static int vidqent_alloc(struct vidqent **qentp,
 }
 
 
-static void vidqueue_poll(struct vtx *vtx, uint64_t jfs, uint64_t prev_jfs)
-{
-	size_t burst, sent;
-	uint64_t bandwidth_kbps;
-	struct le *le;
-
-	if (!vtx)
-		return;
-
-	lock_write_get(vtx->lock_tx);
-
-	le = vtx->sendq.head;
-	if (!le)
-		goto out;
-
-	/*
-	 * time [ms] * bitrate [kbps] / 8 = bytes
-	 */
-	bandwidth_kbps = vtx->video->cfg.bitrate / 1000;
-	burst = (size_t)((1 + jfs - prev_jfs) * bandwidth_kbps / 4);
-
-	burst = min(burst, BURST_MAX);
-	sent  = 0;
-
-	while (le) {
-
-		struct vidqent *qent = le->data;
-
-		sent += mbuf_get_left(qent->mb);
-
-		stream_send(vtx->video->strm, false, qent->marker, qent->pt,
-			    qent->ts, qent->mb);
-
-		le = le->next;
-		mem_deref(qent);
-
-		if (sent > burst) {
-			break;
-		}
-	}
-
- out:
-	lock_rel(vtx->lock_tx);
-}
-
-
-static void rtp_tmr_handler(void *arg)
-{
-	struct vtx *vtx = arg;
-	uint64_t pjfs;
-
-	pjfs = vtx->tmr_rtp.jfs;
-
-	tmr_start(&vtx->tmr_rtp, 1000/MEDIA_POLL_RATE, rtp_tmr_handler, vtx);
-
-	vidqueue_poll(vtx, vtx->tmr_rtp.jfs, pjfs);
-}
-
-
 static void video_destructor(void *arg)
 {
 	struct video *v = arg;
 	struct vtx *vtx = &v->vtx;
 	struct vrx *vrx = &v->vrx;
 
+	stream_enable(v->strm, false);
+
 	/* transmit */
-	lock_write_get(vtx->lock_tx);
+	if (re_atomic_rlx(&vtx->run)) {
+		re_atomic_rlx_set(&vtx->run, false);
+		cnd_signal(&vtx->wait);
+		thrd_join(vtx->thrd, NULL);
+	}
+	mtx_lock(vtx->lock_tx);
 	list_flush(&vtx->sendq);
-	lock_rel(vtx->lock_tx);
+	list_flush(&vtx->sendqnb);
+	mtx_unlock(vtx->lock_tx);
 	mem_deref(vtx->lock_tx);
 
-	tmr_cancel(&vtx->tmr_rtp);
 	mem_deref(vtx->vsrc);
-	lock_write_get(vtx->lock_enc);
+	mtx_lock(vtx->lock_enc);
 	mem_deref(vtx->frame);
 	mem_deref(vtx->enc);
 	list_flush(&vtx->filtl);
-	lock_rel(vtx->lock_enc);
+	mtx_unlock(vtx->lock_enc);
 	mem_deref(vtx->lock_enc);
 
 	/* receive */
 	tmr_cancel(&vrx->tmr_picup);
-	lock_write_get(vrx->lock);
+	mtx_lock(&vrx->lock);
 	mem_deref(vrx->dec);
 	mem_deref(vrx->vidisp);
 	list_flush(&vrx->filtl);
-	lock_rel(vrx->lock);
-	mem_deref(vrx->lock);
+	mtx_unlock(&vrx->lock);
+	mtx_destroy(&vrx->lock);
 
 	tmr_cancel(&v->tmr);
 	mem_deref(v->strm);
@@ -338,34 +331,39 @@ static double get_fps(const struct video *v)
 static int packet_handler(bool marker, uint64_t ts,
 			  const uint8_t *hdr, size_t hdr_len,
 			  const uint8_t *pld, size_t pld_len,
-			  void *arg)
+			  const struct video *vid)
 {
-	struct vtx *vtx = arg;
-	struct stream *strm = vtx->video->strm;
+	struct vtx *vtx = (struct vtx *)&vid->vtx;
+	struct stream *strm = vid->strm;
 	struct vidqent *qent;
 	uint32_t rtp_ts;
+	int pt;
 	int err;
 
-	MAGIC_CHECK(vtx->video);
+	MAGIC_CHECK(vid);
 
+	mtx_lock(vtx->lock_tx);
 	if (!vtx->ts_base)
 		vtx->ts_base = ts;
 	vtx->ts_last = ts;
+	pt = stream_pt_enc(strm);
+	mtx_unlock(vtx->lock_tx);
 
 	/* add random timestamp offset */
 	rtp_ts = vtx->ts_offset + (ts & 0xffffffff);
 
-	err = vidqent_alloc(&qent, marker, strm->pt_enc, rtp_ts,
+	err = vidqent_alloc(&qent, strm, marker, pt, rtp_ts,
 			    hdr, hdr_len, pld, pld_len);
 	if (err)
 		return err;
 
-	lock_write_get(vtx->lock_tx);
-	qent->dst = *sdp_media_raddr(strm->sdp);
+	mtx_lock(vtx->lock_tx);
 	list_append(&vtx->sendq, &qent->le, qent);
-	lock_rel(vtx->lock_tx);
+	mtx_unlock(vtx->lock_tx);
 
-	return err;
+	cnd_signal(&vtx->wait);
+
+	return 0;
 }
 
 
@@ -379,7 +377,7 @@ static int packet_handler(bool marker, uint64_t ts,
  * @param timestamp  Frame timestamp in VIDEO_TIMEBASE units
  */
 static void encode_rtp_send(struct vtx *vtx, struct vidframe *frame,
-			    uint64_t timestamp)
+			    struct vidpacket *packet, uint64_t timestamp)
 {
 	struct le *le;
 	int err = 0;
@@ -388,16 +386,34 @@ static void encode_rtp_send(struct vtx *vtx, struct vidframe *frame,
 	if (!vtx->enc)
 		return;
 
-	lock_write_get(vtx->lock_tx);
+	if (packet) {
+		mtx_lock(vtx->lock_enc);
+
+		if (vtx->vc && vtx->vc->packetizeh) {
+			err = vtx->vc->packetizeh(vtx->enc, packet);
+			if (err)
+				goto out;
+
+			vtx->picup = false;
+		}
+		else {
+			warning("video: Skipping Packet as"
+				" Packetize Handler not initialized ..\n");
+		}
+		goto out;
+	}
+
+	mtx_lock(vtx->lock_tx);
 	sendq_empty = (vtx->sendq.head == NULL);
-	lock_rel(vtx->lock_tx);
 
 	if (!sendq_empty) {
 		++vtx->skipc;
+		mtx_unlock(vtx->lock_tx);
 		return;
 	}
+	mtx_unlock(vtx->lock_tx);
 
-	lock_write_get(vtx->lock_enc);
+	mtx_lock(vtx->lock_enc);
 
 	/* Convert image */
 	if (frame->fmt != (enum vidfmt)vtx->video->cfg.enc_fmt) {
@@ -440,7 +456,7 @@ static void encode_rtp_send(struct vtx *vtx, struct vidframe *frame,
 	vtx->picup = false;
 
  out:
-	lock_rel(vtx->lock_enc);
+	mtx_unlock(vtx->lock_enc);
 }
 
 
@@ -460,14 +476,24 @@ static void vidsrc_frame_handler(struct vidframe *frame, uint64_t timestamp,
 
 	MAGIC_CHECK(vtx->video);
 
-	lock_write_get(vtx->lock_enc);
+	mtx_lock(vtx->lock_enc);
 	++vtx->frames;
-	lock_rel(vtx->lock_enc);
-
 	++vtx->stats.src_frames;
+	mtx_unlock(vtx->lock_enc);
 
 	/* Encode and send */
-	encode_rtp_send(vtx, frame, timestamp);
+	encode_rtp_send(vtx, frame, NULL, timestamp);
+}
+
+
+static void vidsrc_packet_handler(struct vidpacket *packet, void *arg)
+{
+	struct vtx *vtx = arg;
+
+	MAGIC_CHECK(vtx->video);
+
+	/* Encode and send */
+	encode_rtp_send(vtx, NULL, packet, packet->timestamp);
 }
 
 
@@ -483,16 +509,107 @@ static void vidsrc_error_handler(int err, void *arg)
 }
 
 
+static int vtx_thread(void *arg)
+{
+	struct vtx *vtx = arg;
+	uint64_t jfs;
+	uint64_t start_jfs  = tmr_jiffies_usec();
+	uint64_t target_jfs = tmr_jiffies_usec();
+	uint32_t bitrate;
+
+	if (vtx->video->cfg.send_bitrate)
+		bitrate = vtx->video->cfg.send_bitrate;
+	else
+		bitrate = vtx->video->cfg.bitrate;
+
+	const uint64_t max_delay = PKT_SIZE * 8 * 1000000LL / bitrate + 1;
+	const uint64_t max_burst =
+		vtx->video->cfg.burst_bits * 1000000LL / bitrate;
+
+	struct vidqent *qent = NULL;
+	struct mbuf *mbd;
+	size_t sent = 0;
+
+	while (re_atomic_rlx(&vtx->run)) {
+		mtx_lock(vtx->lock_tx);
+		if (!vtx->sendq.head) {
+			cnd_wait(&vtx->wait, vtx->lock_tx);
+			qent = NULL;
+			mtx_unlock(vtx->lock_tx);
+			continue;
+		}
+		qent = vtx->sendq.head->data;
+		mtx_unlock(vtx->lock_tx);
+
+		jfs = tmr_jiffies_usec();
+
+		if (jfs < target_jfs) {
+			uint64_t delay = target_jfs - jfs;
+			if (delay > max_delay) {
+				delay	  = max_delay;
+				start_jfs = jfs + delay;
+				sent	  = 0;
+			}
+			sys_usleep((unsigned int)delay);
+		}
+		else {
+			if (jfs - max_burst > target_jfs) {
+				start_jfs = jfs - max_burst;
+				sent	  = 0;
+			}
+		}
+
+		sent += mbuf_get_left(qent->mb) * 8;
+		target_jfs = start_jfs + sent * 1000000 / bitrate;
+
+		mbd = mbuf_dup(qent->mb);
+
+		stream_send(vtx->video->strm, qent->ext, qent->marker,
+			    qent->pt, qent->ts, qent->mb);
+
+		mem_deref(qent->mb);
+
+		qent->jfs_nack = jfs + NACK_QUEUE_TIME * 1000;
+		qent->seq = rtp_sess_seq(stream_rtp_sock(vtx->video->strm));
+		qent->mb  = mbd;
+
+		mtx_lock(vtx->lock_tx);
+		list_move(&qent->le, &vtx->sendqnb);
+
+		/* Delayed NACK queue cleanup */
+		struct le *le = vtx->sendqnb.head;
+		while (le) {
+			qent = le->data;
+
+			le = le->next;
+
+			if (jfs > qent->jfs_nack)
+				mem_deref(qent);
+			else
+				break; /* Assuming list is sorted by time */
+		}
+		mtx_unlock(vtx->lock_tx);
+	}
+
+	return 0;
+}
+
+
 static int vtx_alloc(struct vtx *vtx, struct video *video)
 {
 	int err;
 
-	err  = lock_alloc(&vtx->lock_enc);
-	err |= lock_alloc(&vtx->lock_tx);
+	err = mutex_alloc(&vtx->lock_enc);
 	if (err)
 		return err;
 
-	tmr_init(&vtx->tmr_rtp);
+	err = mutex_alloc(&vtx->lock_tx);
+	if (err)
+		return err;
+
+	err |= cnd_init(&vtx->wait) != thrd_success;
+	if (err)
+		return ENOMEM;
 
 	vtx->video = video;
 
@@ -501,11 +618,9 @@ static int vtx_alloc(struct vtx *vtx, struct video *video)
 
 	str_ncpy(vtx->device, video->cfg.src_dev, sizeof(vtx->device));
 
-	tmr_start(&vtx->tmr_rtp, 1, rtp_tmr_handler, vtx);
-
 	vtx->fmt = (enum vidfmt)-1;
 
-	return err;
+	return 0;
 }
 
 
@@ -513,9 +628,9 @@ static int vrx_alloc(struct vrx *vrx, struct video *video)
 {
 	int err;
 
-	err = lock_alloc(&vrx->lock);
+	err = mtx_init(&vrx->lock, mtx_plain) != thrd_success;
 	if (err)
-		return err;
+		return ENOMEM;
 
 	vrx->video  = video;
 	vrx->pt_rx  = -1;
@@ -525,7 +640,7 @@ static int vrx_alloc(struct vrx *vrx, struct video *video)
 
 	vrx->fmt = (enum vidfmt)-1;
 
-	return err;
+	return 0;
 }
 
 
@@ -539,6 +654,28 @@ static void picup_tmr_handler(void *arg)
 }
 
 
+static void send_fir(struct stream *s, bool pli)
+{
+	int err;
+
+	if (pli) {
+		uint32_t ssrc;
+
+		err = stream_ssrc_rx(s, &ssrc);
+		if (!err)
+			err = rtcp_send_pli(stream_rtp_sock(s), ssrc);
+	}
+	else
+		err = rtcp_send_fir(stream_rtp_sock(s),
+				    rtp_sess_ssrc(stream_rtp_sock(s)));
+
+	if (err) {
+		warning("video: failed to send RTCP %s: %m\n",
+			pli ? "PLI" : "FIR", err);
+	}
+}
+
+
 static void request_picture_update(struct vrx *vrx)
 {
 	struct video *v = vrx->video;
@@ -549,7 +686,7 @@ static void request_picture_update(struct vrx *vrx)
 	tmr_start(&vrx->tmr_picup, PICUP_INTERVAL, picup_tmr_handler, vrx);
 
 	/* send RTCP FIR to peer */
-	stream_send_fir(v->strm, v->nack_pli);
+	send_fir(v->strm, v->nack_pli);
 
 	++vrx->n_picup;
 }
@@ -590,6 +727,12 @@ static void update_rtp_timestamp(struct timestamp_recv *tsr, uint32_t rtp_ts)
 }
 
 
+static void vidframe_clear(struct vidframe *frame)
+{
+	frame->data[0] = NULL;
+}
+
+
 /**
  * Decode incoming RTP packets using the Video decoder
  *
@@ -607,15 +750,14 @@ static int video_stream_decode(struct vrx *vrx, const struct rtp_header *hdr,
 	struct video *v = vrx->video;
 	struct vidframe *frame_filt = NULL;
 	struct vidframe frame_store, *frame = &frame_store;
+	struct viddec_packet pkt = {.mb = mb, .hdr = hdr};
 	struct le *le;
-	uint64_t timestamp;
-	bool intra;
 	int err = 0;
 
 	if (!hdr || !mbuf_get_left(mb))
 		return 0;
 
-	lock_write_get(vrx->lock);
+	mtx_lock(&vrx->lock);
 
 	/* No decoder set */
 	if (!vrx->dec) {
@@ -626,12 +768,13 @@ static int video_stream_decode(struct vrx *vrx, const struct rtp_header *hdr,
 	update_rtp_timestamp(&vrx->ts_recv, hdr->ts);
 
 	/* convert the RTP timestamp to VIDEO_TIMEBASE timestamp */
-	timestamp = video_calc_timebase_timestamp(
+	pkt.timestamp = video_calc_timebase_timestamp(
 			  timestamp_calc_extended(vrx->ts_recv.num_wraps,
 						  vrx->ts_recv.last));
 
-	frame->data[0] = NULL;
-	err = vrx->vc->dech(vrx->dec, frame, &intra, hdr->m, hdr->seq, mb);
+	vidframe_clear(frame);
+
+	err = vrx->vc->dech(vrx->dec, frame, &pkt);
 	if (err) {
 
 		if (err != EPROTO) {
@@ -641,12 +784,13 @@ static int video_stream_decode(struct vrx *vrx, const struct rtp_header *hdr,
 				mbuf_get_left(mb), err);
 		}
 
+		RE_TRACE_INSTANT("video", "decode_err");
 		request_picture_update(vrx);
 
 		goto out;
 	}
 
-	if (intra) {
+	if (pkt.intra) {
 		tmr_cancel(&vrx->tmr_picup);
 		++vrx->n_intra;
 	}
@@ -682,18 +826,22 @@ static int video_stream_decode(struct vrx *vrx, const struct rtp_header *hdr,
 		struct vidfilt_dec_st *st = le->data;
 
 		if (st->vf && st->vf->dech)
-			err |= st->vf->dech(st, frame, &timestamp);
+			err |= st->vf->dech(st, frame, &pkt.timestamp);
 	}
 
 	++vrx->stats.disp_frames;
 
-	err = vidisp_display(vrx->vidisp, v->peer, frame, timestamp);
+	if (vrx->vd && vrx->vd->disph && vrx->vidisp)
+		err = vrx->vd->disph(vrx->vidisp, v->peer, frame,
+				     pkt.timestamp);
+
 	frame_filt = mem_deref(frame_filt);
 	if (err == ENODEV) {
 		warning("video: video-display was closed\n");
 		vrx->vidisp = mem_deref(vrx->vidisp);
+		vrx->vd = NULL;
 
-		lock_rel(vrx->lock);
+		mtx_unlock(&vrx->lock);
 
 		if (v->errh) {
 			v->errh(err, "display closed", v->arg);
@@ -705,27 +853,30 @@ static int video_stream_decode(struct vrx *vrx, const struct rtp_header *hdr,
 	++vrx->frames;
 
 out:
-	lock_rel(vrx->lock);
+	mtx_unlock(&vrx->lock);
 
 	return err;
 }
 
 
-static int update_payload_type(struct video *v, uint8_t pt_old, uint8_t pt_new)
+static int stream_pt_handler(uint8_t pt, struct mbuf *mb, void *arg)
 {
+	struct video *v = arg;
 	const struct sdp_format *lc;
+	(void)mb;
 
-	lc = sdp_media_lformat(stream_sdpmedia(v->strm), pt_new);
+	if (v->vrx.pt_rx == (uint8_t)-1 || v->vrx.pt_rx == pt)
+		return 0;
+
+	if (v->vrx.pt_rx != -1)
+		info("Video decoder changed payload %d -> %u\n",
+		     v->vrx.pt_rx, pt);
+
+	lc = sdp_media_lformat(stream_sdpmedia(v->strm), pt);
 	if (!lc)
 		return ENOENT;
 
-	if (pt_old != (uint8_t)-1) {
-		info("Video decoder changed payload %u -> %u\n",
-		     pt_old, pt_new);
-	}
-
-	v->vrx.pt_rx = pt_new;
-
+	v->vrx.pt_rx = pt;
 	return video_decoder_set(v, lc->data, lc->pt, lc->rparams);
 }
 
@@ -733,12 +884,13 @@ static int update_payload_type(struct video *v, uint8_t pt_old, uint8_t pt_new)
 /* Handle incoming stream data from the network */
 static void stream_recv_handler(const struct rtp_header *hdr,
 				struct rtpext *extv, size_t extc,
-				struct mbuf *mb, unsigned lostc, void *arg)
+				struct mbuf *mb, unsigned lostc, bool *ignore,
+				void *arg)
 {
 	struct video *v = arg;
-	int err;
 	(void)extv;
 	(void)extc;
+	(void)ignore;
 
 	MAGIC_CHECK(v);
 
@@ -746,25 +898,64 @@ static void stream_recv_handler(const struct rtp_header *hdr,
 	if (lostc)
 		request_picture_update(&v->vrx);
 
-	if (!mb)
-		goto out;
+	(void)video_stream_decode(&v->vrx, hdr, mb);
+}
 
-	/* Video payload-type changed? */
-	if (hdr->pt == v->vrx.pt_rx)
-		goto out;
 
-	err = update_payload_type(v, v->vrx.pt_rx, hdr->pt);
-	if (err)
+static void rtcp_nack_handler(struct vtx *vtx, struct rtcp_msg *msg)
+{
+	uint16_t nack_pid;
+	uint16_t nack_blp;
+	uint16_t pids[NACK_BLPSZ + 1];
+	struct le *le;
+
+	if (!msg || msg->hdr.count != RTCP_RTPFB_GNACK ||
+	    !msg->r.fb.fci.gnackv)
 		return;
 
- out:
-	(void)video_stream_decode(&v->vrx, hdr, mb);
+	nack_pid = msg->r.fb.fci.gnackv->pid;
+	nack_blp = msg->r.fb.fci.gnackv->blp;
+	pids[0]	 = nack_pid;
+
+	if (nack_blp) {
+		for (int i = 1; i < NACK_BLPSZ + 1; i++) {
+			if (nack_blp & (1 << (i - 1))) {
+				pids[i] = nack_pid + i;
+			}
+		}
+	}
+
+	mtx_lock(vtx->lock_tx);
+	LIST_FOREACH(&vtx->sendqnb, le) {
+		struct vidqent *qent = le->data;
+
+		if (qent->seq == nack_pid)
+			break;
+	}
+
+	for (int i = 0; i < NACK_BLPSZ + 1 && le; i++) {
+		struct vidqent *qent = le->data;
+
+		le = le->next;
+		if (qent->seq != pids[i])
+			continue;
+
+		debug("NACK resend rtp seq: %u\n", pids[i]);
+		stream_resend(vtx->video->strm, qent->seq, qent->ext,
+			      qent->marker, qent->pt, qent->ts, qent->mb);
+
+		/* sent only once */
+		mem_deref(qent);
+	}
+
+	mtx_unlock(vtx->lock_tx);
 }
 
 
 static void rtcp_handler(struct stream *strm, struct rtcp_msg *msg, void *arg)
 {
 	struct video *v = arg;
+	struct vtx *vtx = &v->vtx;
 	(void)strm;
 
 	MAGIC_CHECK(v);
@@ -772,17 +963,22 @@ static void rtcp_handler(struct stream *strm, struct rtcp_msg *msg, void *arg)
 	switch (msg->hdr.pt) {
 
 	case RTCP_FIR:
-		v->vtx.picup = true;
+		mtx_lock(vtx->lock_enc);
+		vtx->picup = true;
+		mtx_unlock(vtx->lock_enc);
 		break;
 
 	case RTCP_PSFB:
-		if (msg->hdr.count == RTCP_PSFB_PLI)
-			v->vtx.picup = true;
+		if (msg->hdr.count == RTCP_PSFB_PLI) {
+			debug("video: recv Picture Loss Indication (PLI)\n");
+			mtx_lock(vtx->lock_enc);
+			vtx->picup = true;
+			mtx_unlock(vtx->lock_enc);
+		}
 		break;
 
 	case RTCP_RTPFB:
-		if (msg->hdr.count == RTCP_RTPFB_GNACK)
-			v->vtx.picup = true;
+		rtcp_nack_handler(vtx, msg);
 		break;
 
 	default:
@@ -800,10 +996,10 @@ static int vtx_print_pipeline(struct re_printf *pf, const struct vtx *vtx)
 	if (!vtx)
 		return 0;
 
-	vs = vidsrc_get(vtx->vsrc);
+	vs = vtx->vs;
 
 	err = re_hprintf(pf, "video tx pipeline: %10s",
-			 vs ? vs->name : "src");
+			 vs ? vs->name : "(src)");
 
 	for (le = list_head(&vtx->filtl); le; le = le->next) {
 		struct vidfilt_enc_st *st = le->data;
@@ -813,7 +1009,7 @@ static int vtx_print_pipeline(struct re_printf *pf, const struct vtx *vtx)
 	}
 
 	err |= re_hprintf(pf, " ---> %s\n",
-			  vtx->vc ? vtx->vc->name : "encoder");
+			  vtx->vc ? vtx->vc->name : "(encoder)");
 
 	return err;
 }
@@ -828,10 +1024,10 @@ static int vrx_print_pipeline(struct re_printf *pf, const struct vrx *vrx)
 	if (!vrx)
 		return 0;
 
-	vd = vidisp_get(vrx->vidisp);
+	vd = vrx->vd;
 
 	err = re_hprintf(pf, "video rx pipeline: %10s",
-			 vd ? vd->name : "disp");
+			 vd ? vd->name : "(disp)");
 
 	for (le = list_head(&vrx->filtl); le; le = le->next) {
 		struct vidfilt_dec_st *st = le->data;
@@ -841,7 +1037,7 @@ static int vrx_print_pipeline(struct re_printf *pf, const struct vrx *vrx)
 	}
 
 	err |= re_hprintf(pf, " <--- %s\n",
-			  vrx->vc ? vrx->vc->name : "decoder");
+			  vrx->vc ? vrx->vc->name : "(decoder)");
 
 	return err;
 }
@@ -855,7 +1051,6 @@ static int vrx_print_pipeline(struct re_printf *pf, const struct vrx *vrx)
  * @param stream_prm Stream parameters
  * @param cfg        Global configuration
  * @param sdp_sess   SDP Session
- * @param label      SDP label
  * @param mnat       Media NAT (optional)
  * @param mnat_sess  Media NAT session (optional)
  * @param menc       Media Encryption (optional)
@@ -872,7 +1067,7 @@ static int vrx_print_pipeline(struct re_printf *pf, const struct vrx *vrx)
 int video_alloc(struct video **vp, struct list *streaml,
 		const struct stream_param *stream_prm,
 		const struct config *cfg,
-		struct sdp_session *sdp_sess, int label,
+		struct sdp_session *sdp_sess,
 		const struct mnat *mnat, struct mnat_sess *mnat_sess,
 		const struct menc *menc, struct menc_sess *menc_sess,
 		const char *content, const struct list *vidcodecl,
@@ -887,29 +1082,41 @@ int video_alloc(struct video **vp, struct list *streaml,
 	if (!vp || !cfg)
 		return EINVAL;
 
-	v = mem_zalloc(sizeof(*v), video_destructor);
+	v = mem_zalloc(sizeof(*v), NULL);
 	if (!v)
 		return ENOMEM;
 
 	MAGIC_INIT(v);
 
 	v->cfg = cfg->video;
+
+	err  = vtx_alloc(&v->vtx, v);
+	err |= vrx_alloc(&v->vrx, v);
+	if (err)
+		goto out;
+
+	mem_destructor(v, video_destructor);
+
 	tmr_init(&v->tmr);
 
 	err = stream_alloc(&v->strm, streaml, stream_prm,
-			   &cfg->avt, sdp_sess, MEDIA_VIDEO, label,
+			   &cfg->avt, sdp_sess, MEDIA_VIDEO,
 			   mnat, mnat_sess, menc, menc_sess, offerer,
-			   stream_recv_handler, rtcp_handler, v);
+			   stream_recv_handler, rtcp_handler,
+			   stream_pt_handler, v);
 	if (err)
 		goto out;
 
 	if (vidisp_find(baresip_vidispl(), NULL) == NULL)
-		sdp_media_set_ldir(v->strm->sdp, SDP_SENDONLY);
+		stream_set_ldir(v->strm, SDP_SENDONLY);
 
 	stream_set_srate(v->strm, VIDEO_SRATE, VIDEO_SRATE);
 
 	if (cfg->avt.rtp_bw.max >= AUDIO_BANDWIDTH) {
-		stream_set_bw(v->strm, cfg->avt.rtp_bw.max - AUDIO_BANDWIDTH);
+		uint32_t bps = cfg->avt.rtp_bw.max - AUDIO_BANDWIDTH;
+
+		sdp_media_set_lbandwidth(stream_sdpmedia(v->strm),
+					 SDP_BANDWIDTH_AS, bps / 1000);
 	}
 
 	err |= sdp_media_set_lattr(stream_sdpmedia(v->strm), true,
@@ -917,6 +1124,9 @@ int video_alloc(struct video **vp, struct list *streaml,
 
 	/* RFC 4585 */
 	err |= sdp_media_set_lattr(stream_sdpmedia(v->strm), true,
+				   "rtcp-fb", "* nack");
+
+	err |= sdp_media_set_lattr(stream_sdpmedia(v->strm), false,
 				   "rtcp-fb", "* nack pli");
 
 	/* RFC 4796 */
@@ -931,11 +1141,6 @@ int video_alloc(struct video **vp, struct list *streaml,
 	v->errh = errh;
 	v->arg = arg;
 
-	err  = vtx_alloc(&v->vtx, v);
-	err |= vrx_alloc(&v->vrx, v);
-	if (err)
-		goto out;
-
 	/* Video codecs */
 	for (le = list_head(vidcodecl); le; le = le->next) {
 		struct vidcodec *vc = le->data;
@@ -948,16 +1153,21 @@ int video_alloc(struct video **vp, struct list *streaml,
 	/* Video filters */
 	for (le = list_head(vidfiltl); le; le = le->next) {
 		struct vidfilt *vf = le->data;
-		struct vidfilt_prm prm;
+		struct vidfilt_prm prmenc, prmdec;
 		void *ctx = NULL;
 
-		prm.width  = v->cfg.width;
-		prm.height = v->cfg.height;
-		prm.fmt    = v->cfg.enc_fmt;
-		prm.fps    = get_fps(v);
+		prmenc.width  = v->cfg.width;
+		prmenc.height = v->cfg.height;
+		prmenc.fmt    = v->cfg.enc_fmt;
+		prmenc.fps    = get_fps(v);
 
-		err |= vidfilt_enc_append(&v->vtx.filtl, &ctx, vf, &prm, v);
-		err |= vidfilt_dec_append(&v->vrx.filtl, &ctx, vf, &prm, v);
+		prmdec.width  = 0;
+		prmdec.height = 0;
+		prmdec.fmt    = -1;
+		prmdec.fps    = .0;
+
+		err |= vidfilt_enc_append(&v->vtx.filtl, &ctx, vf, &prmenc, v);
+		err |= vidfilt_dec_append(&v->vrx.filtl, &ctx, vf, &prmdec, v);
 		if (err) {
 			warning("video: video-filter '%s' failed (%m)\n",
 				vf->name, err);
@@ -990,8 +1200,10 @@ static void vidisp_resize_handler(const struct vidsz *sz, void *arg)
 static int set_vidisp(struct vrx *vrx)
 {
 	struct vidisp *vd;
+	int err;
 
 	vrx->vidisp = mem_deref(vrx->vidisp);
+	vrx->vd = NULL;
 
 	vrx->vidisp_prm.fullscreen = vrx->video->cfg.fullscreen;
 
@@ -1000,8 +1212,14 @@ static int set_vidisp(struct vrx *vrx)
 	if (!vd)
 		return ENOENT;
 
-	return vd->alloch(&vrx->vidisp, vd, &vrx->vidisp_prm, vrx->device,
-			  vidisp_resize_handler, vrx);
+	err = vd->alloch(&vrx->vidisp, vd, &vrx->vidisp_prm, vrx->device,
+			 vidisp_resize_handler, vrx);
+	if (err)
+		return err;
+
+	vrx->vd = vd;
+
+	return 0;
 }
 
 
@@ -1015,7 +1233,7 @@ static void tmr_handler(void *arg)
 	tmr_start(&v->tmr, TMR_INTERVAL * 1000, tmr_handler, v);
 
 	/* protect vtx.frames */
-	lock_write_get(v->vtx.lock_enc);
+	mtx_lock(v->vtx.lock_enc);
 
 	/* Estimate framerates */
 	v->vtx.efps = (double)v->vtx.frames / (double)TMR_INTERVAL;
@@ -1024,7 +1242,75 @@ static void tmr_handler(void *arg)
 	v->vtx.frames = 0;
 	v->vrx.frames = 0;
 
-	lock_rel(v->vtx.lock_enc);
+	mtx_unlock(v->vtx.lock_enc);
+}
+
+
+/**
+ * Update video object and start/stop according to media direction
+ *
+ * @param v    Video object
+ * @param peer Peer-URI as string
+ *
+ * @return int 0 if success, otherwise errorcode
+ */
+int video_update(struct video *v, const char *peer)
+{
+	const struct sdp_format *sc = NULL;
+	enum sdp_dir dir = SDP_INACTIVE;
+	struct sdp_media *m = NULL;
+	int err = 0;
+
+	if (!v)
+		return EINVAL;
+
+	m = stream_sdpmedia(v->strm);
+
+	debug("video: update\n");
+
+	if (!sdp_media_disabled(m)) {
+		dir = sdp_media_dir(m);
+		sc = sdp_media_rformat(m, NULL);
+	}
+
+	if (!sc) {
+		info("video: video stream is disabled..\n");
+		video_stop(v);
+		return 0;
+	}
+
+	if (dir & SDP_SENDONLY)
+		err = video_encoder_set(v, sc->data, sc->pt, sc->params);
+
+	if (dir & SDP_RECVONLY)
+		err |= video_decoder_set(v, sc->data, sc->pt, sc->rparams);
+
+	/* Stop / Start source & display*/
+	if (dir & SDP_SENDONLY) {
+		err |= video_start_source(v);
+	}
+	else {
+		video_stop_source(v);
+	}
+
+	if (dir == SDP_RECVONLY)
+		stream_open_natpinhole(v->strm);
+	else
+		stream_stop_natpinhole(v->strm);
+
+	if (dir & SDP_RECVONLY) {
+		err |= video_start_display(v, peer);
+		stream_enable_rx(v->strm, true);
+	}
+	else {
+		stream_enable_rx(v->strm, false);
+		video_stop_display(v);
+	}
+
+	if (err)
+		warning("video: video stream error: %m\n", err);
+
+	return err;
 }
 
 
@@ -1032,21 +1318,25 @@ static void tmr_handler(void *arg)
  * Start the video source
  *
  * @param v   Video object
- * @param ctx Media context
  *
  * @return 0 if success, otherwise errorcode
  */
-int video_start_source(struct video *v, struct media_ctx **ctx)
+int video_start_source(struct video *v)
 {
-	struct vtx *vtx = &v->vtx;
 	struct vidsz size;
 	int err;
 
 	if (!v)
 		return EINVAL;
 
-	if (vidsrc_find(baresip_vidsrcl(), NULL)) {
+	if (v->vtx.vsrc)
+		return 0;
 
+	struct vtx *vtx = &v->vtx;
+
+	debug("video: start source\n");
+
+	if (vidsrc_find(baresip_vidsrcl(), NULL)) {
 		struct vidsrc *vs;
 
 		vs = (struct vidsrc *)vidsrc_find(baresip_vidsrcl(),
@@ -1066,29 +1356,34 @@ int video_start_source(struct video *v, struct media_ctx **ctx)
 
 		vtx->vsrc = mem_deref(vtx->vsrc);
 
-		err = vs->alloch(&vtx->vsrc, vs, ctx, &vtx->vsrc_prm,
+		err = vs->alloch(&vtx->vsrc, vs, &vtx->vsrc_prm,
 				 &vtx->vsrc_size, NULL, v->vtx.device,
-				 vidsrc_frame_handler,
+				 vidsrc_frame_handler, vidsrc_packet_handler,
 				 vidsrc_error_handler, vtx);
 		if (err) {
 			warning("video: could not set source to"
 				" [%u x %u] %m\n",
 				size.w, size.h, err);
 		}
+
+		vtx->vs = vs;
+		if (v->vtx.vc)
+			info("%H", vtx_print_pipeline, &v->vtx);
 	}
 	else {
 		info("video: no video source\n");
 	}
 
-	tmr_start(&v->tmr, TMR_INTERVAL * 1000, tmr_handler, v);
-
-	if (v->vtx.vc && v->vrx.vc) {
-		info("%H%H",
-		     vtx_print_pipeline, &v->vtx,
-		     vrx_print_pipeline, &v->vrx);
+	if (!re_atomic_rlx(&vtx->run)) {
+		re_atomic_rlx_set(&vtx->run, true);
+		thread_create_name(&vtx->thrd, "Video TX", vtx_thread, vtx);
+	}
+	else {
+		warning("video_start_source: Video TX already started\n");
 	}
 
-	v->started = true;
+	stream_enable_tx(v->strm, true);
+	tmr_start(&v->tmr, TMR_INTERVAL * 1000, tmr_handler, v);
 
 	return 0;
 }
@@ -1109,6 +1404,11 @@ int video_start_display(struct video *v, const char *peer)
 	if (!v)
 		return EINVAL;
 
+	if (v->vrx.vidisp)
+		return 0;
+
+	debug("video: start display\n");
+
 	if (peer) {
 		v->peer = mem_deref(v->peer);
 		err = str_dup(&v->peer, peer);
@@ -1123,6 +1423,9 @@ int video_start_display(struct video *v, const char *peer)
 				v->vrx.device, err);
 			return err;
 		}
+
+		if (v->vrx.vc)
+			info("%H", vrx_print_pipeline, &v->vrx);
 	}
 	else {
 		info("video: no video display\n");
@@ -1137,15 +1440,26 @@ int video_start_display(struct video *v, const char *peer)
  *
  * @param v   Video object
  */
-void video_stop(struct video *v)
+static void video_stop_source(struct video *v)
 {
 	if (!v)
 		return;
 
 	debug("video: stopping video source ..\n");
 
-	v->started = false;
+	stream_enable_tx(v->strm, false);
 	v->vtx.vsrc = mem_deref(v->vtx.vsrc);
+
+	if (re_atomic_rlx(&v->vtx.run)) {
+		re_atomic_rlx_set(&v->vtx.run, false);
+		cnd_signal(&v->vtx.wait);
+		thrd_join(v->vtx.thrd, NULL);
+	}
+
+	mtx_lock(v->vtx.lock_tx);
+	list_flush(&v->vtx.sendq);
+	list_flush(&v->vtx.sendqnb);
+	mtx_unlock(v->vtx.lock_tx);
 }
 
 
@@ -1165,15 +1479,21 @@ void video_stop_display(struct video *v)
 }
 
 
-bool video_is_started(const struct video *v)
+/**
+ * Stop video sourc & display
+ *
+ * @param v   Video object
+ */
+void video_stop(struct video *v)
 {
-	return v ? v->started : false;
+	video_stop_source(v);
+	video_stop_display(v);
 }
 
 
 static int vidisp_update(struct vrx *vrx)
 {
-	struct vidisp *vd = vidisp_get(vrx->vidisp);
+	struct vidisp *vd = vrx->vd;
 	int err = 0;
 
 	if (vd->updateh) {
@@ -1206,7 +1526,7 @@ int video_set_fullscreen(struct video *v, bool fs)
 
 static void vidsrc_update(struct vtx *vtx, const char *dev)
 {
-	struct vidsrc *vs = vidsrc_get(vtx->vsrc);
+	struct vidsrc *vs = vtx->vs;
 
 	if (vs && vs->updateh)
 		vs->updateh(vtx->vsrc, &vtx->vsrc_prm, dev);
@@ -1239,14 +1559,14 @@ int video_encoder_set(struct video *v, struct vidcodec *vc,
 		return ENOENT;
 	}
 
-	lock_write_get(vtx->lock_enc);
+	mtx_lock(vtx->lock_enc);
 
 	if (vc != vtx->vc) {
 
 		struct videnc_param prm;
 
 		prm.bitrate = v->cfg.bitrate;
-		prm.pktsize = 1024;
+		prm.pktsize = PKT_SIZE;
 		prm.fps     = get_fps(v);
 		prm.max_fs  = -1;
 
@@ -1255,7 +1575,7 @@ int video_encoder_set(struct video *v, struct vidcodec *vc,
 
 		vtx->enc = mem_deref(vtx->enc);
 		err = vc->encupdh(&vtx->enc, vc, &prm, params,
-				  packet_handler, vtx);
+				  packet_handler, v);
 		if (err) {
 			warning("video: encoder alloc: %m\n", err);
 			goto out;
@@ -1267,7 +1587,7 @@ int video_encoder_set(struct video *v, struct vidcodec *vc,
 	stream_update_encoder(v->strm, pt_tx);
 
  out:
-	lock_rel(vtx->lock_enc);
+	mtx_unlock(vtx->lock_enc);
 
 	return err;
 }
@@ -1279,7 +1599,7 @@ int video_decoder_set(struct video *v, struct vidcodec *vc, int pt_rx,
 	struct vrx *vrx;
 	int err = 0;
 
-	if (!v)
+	if (!v || !vc)
 		return EINVAL;
 
 	/* handle vidcodecs without a decoder */
@@ -1310,7 +1630,7 @@ int video_decoder_set(struct video *v, struct vidcodec *vc, int pt_rx,
 
 		vrx->dec = mem_deref(vrx->dec);
 
-		err = vc->decupdh(&vrx->dec, vc, fmtp);
+		err = vc->decupdh(&vrx->dec, vc, fmtp, v);
 		if (err) {
 			warning("video: decoder alloc: %m\n", err);
 			return err;
@@ -1333,14 +1653,6 @@ int video_decoder_set(struct video *v, struct vidcodec *vc, int pt_rx,
 struct stream *video_strm(const struct video *v)
 {
 	return v ? v->strm : NULL;
-}
-
-
-void video_update_picture(struct video *v)
-{
-	if (!v)
-		return;
-	v->vtx.picup = true;
 }
 
 
@@ -1374,7 +1686,8 @@ void video_sdp_attr_decode(struct video *v)
 		return;
 
 	/* RFC 4585 */
-	if (sdp_media_rattr_apply(v->strm->sdp, "rtcp-fb", nack_handler, 0))
+	if (sdp_media_rattr_apply(stream_sdpmedia(v->strm), "rtcp-fb",
+				  nack_handler, 0))
 		v->nack_pli = true;
 }
 
@@ -1386,12 +1699,17 @@ static int vtx_debug(struct re_printf *pf, const struct vtx *vtx)
 	err |= re_hprintf(pf, " tx: encode: %s %s\n",
 			  vtx->vc ? vtx->vc->name : "none",
 			  vidfmt_name(vtx->fmt));
+
+	mtx_lock(vtx->lock_enc);
 	err |= re_hprintf(pf, "     source: %s %u x %u, fps=%.2f"
 			  " frames=%llu\n",
-			  vtx->vsrc ? vidsrc_get(vtx->vsrc)->name : "none",
+			  vtx->vs ? vtx->vs->name : "none",
 			  vtx->vsrc_size.w,
 			  vtx->vsrc_size.h, vtx->vsrc_prm.fps,
 			  vtx->stats.src_frames);
+	mtx_unlock(vtx->lock_enc);
+
+	mtx_lock(vtx->lock_tx);
 	err |= re_hprintf(pf, "     skipc=%u sendq=%u\n",
 			  vtx->skipc, list_count(&vtx->sendq));
 
@@ -1402,6 +1720,7 @@ static int vtx_debug(struct re_printf *pf, const struct vtx *vtx)
 	else {
 		err |= re_hprintf(pf, "     time = (not started)\n");
 	}
+	mtx_unlock(vtx->lock_tx);
 
 	return err;
 }
@@ -1415,7 +1734,7 @@ static int vrx_debug(struct re_printf *pf, const struct vrx *vrx)
 			  vrx->vc ? vrx->vc->name : "none",
 			  vidfmt_name(vrx->fmt));
 	err |= re_hprintf(pf, "     vidisp: %s %u x %u frames=%llu\n",
-			  vrx->vidisp ? vidisp_get(vrx->vidisp)->name : "none",
+			  vrx->vd ? vrx->vd->name : "none",
 			  vrx->size.w, vrx->size.h,
 			  vrx->stats.disp_frames);
 	err |= re_hprintf(pf, "     n_keyframes=%u, n_picup=%u\n",
@@ -1454,7 +1773,10 @@ int video_debug(struct re_printf *pf, const struct video *v)
 	vrx = &v->vrx;
 
 	err = re_hprintf(pf, "\n--- Video stream ---\n");
-	err |= re_hprintf(pf, " started: %s\n", v->started ? "yes" : "no");
+	err |= re_hprintf(pf, " source started: %s\n",
+		v->vtx.vsrc ? "yes" : "no");
+	err |= re_hprintf(pf, " display started: %s\n",
+		v->vrx.vidisp ? "yes" : "no");
 
 	err |= vtx_debug(pf, vtx);
 	err |= vrx_debug(pf, vrx);
@@ -1495,6 +1817,7 @@ int video_set_source(struct video *v, const char *name, const char *dev)
 	struct vidsrc *vs = (struct vidsrc *)vidsrc_find(baresip_vidsrcl(),
 							 name);
 	struct vtx *vtx;
+	int err;
 
 	if (!v)
 		return EINVAL;
@@ -1506,9 +1829,16 @@ int video_set_source(struct video *v, const char *name, const char *dev)
 
 	vtx->vsrc = mem_deref(vtx->vsrc);
 
-	return vs->alloch(&vtx->vsrc, vs, NULL, &vtx->vsrc_prm,
-			  &vtx->vsrc_size, NULL, dev,
-			  vidsrc_frame_handler, vidsrc_error_handler, vtx);
+	err = vs->alloch(&vtx->vsrc, vs, &vtx->vsrc_prm,
+			 &vtx->vsrc_size, NULL, dev,
+			 vidsrc_frame_handler, vidsrc_packet_handler,
+			 vidsrc_error_handler, vtx);
+	if (err)
+		return err;
+
+	vtx->vs = vs;
+
+	return 0;
 }
 
 
@@ -1530,6 +1860,38 @@ void video_set_devicename(struct video *v, const char *src, const char *disp)
 
 
 /**
+ * Get the device name of video source
+ *
+ * @param v    Video object
+ *
+ * @return Video source device name, otherwise NULL
+ */
+const char *video_get_src_dev(const struct video *v)
+{
+	if (!v)
+		return NULL;
+
+	return v->vtx.device;
+}
+
+
+/**
+ * Get the device name of video display
+ *
+ * @param v    Video object
+ *
+ * @return Video display device name, otherwise NULL
+ */
+const char *video_get_disp_dev(const struct video *v)
+{
+	if (!v)
+		return NULL;
+
+	return v->vrx.device;
+}
+
+
+/**
  * Get video codec of video stream
  *
  * @param vid Video object
@@ -1543,4 +1905,20 @@ const struct vidcodec *video_codec(const struct video *vid, bool tx)
 		return NULL;
 
 	return tx ? vid->vtx.vc : vid->vrx.vc;
+}
+
+
+/**
+ * Request new keyframe from encoder (vtx)
+ *
+ * @param vid Video object
+ */
+void video_req_keyframe(struct video *vid)
+{
+	if (!vid)
+		return;
+
+	mtx_lock(vid->vtx.lock_enc);
+	vid->vtx.picup = true;
+	mtx_unlock(vid->vtx.lock_enc);
 }

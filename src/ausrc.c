@@ -1,7 +1,7 @@
 /**
  * @file ausrc.c Audio Source
  *
- * Copyright (C) 2010 Creytiv.com
+ * Copyright (C) 2010 Alfred E. Heggestad
  */
 
 #include <re.h>
@@ -84,7 +84,6 @@ const struct ausrc *ausrc_find(const struct list *ausrcl, const char *name)
  *
  * @param stp    Pointer to allocated Audio Source state
  * @param ausrcl List of Audio Sources
- * @param ctx    Media context (optional)
  * @param name   Name of Audio Source
  * @param prm    Audio Source parameters
  * @param device Name of Audio Source device (driver specific)
@@ -95,7 +94,6 @@ const struct ausrc *ausrc_find(const struct list *ausrcl, const char *name)
  * @return 0 if success, otherwise errorcode
  */
 int ausrc_alloc(struct ausrc_st **stp, struct list *ausrcl,
-		struct media_ctx **ctx,
 		const char *name, struct ausrc_prm *prm, const char *device,
 		ausrc_read_h *rh, ausrc_error_h *errh, void *arg)
 {
@@ -105,18 +103,5 @@ int ausrc_alloc(struct ausrc_st **stp, struct list *ausrcl,
 	if (!as)
 		return ENOENT;
 
-	return as->alloch(stp, as, ctx, prm, device, rh, errh, arg);
-}
-
-
-/**
- * Get the audio source module from a audio source state
- *
- * @param st Audio source state
- *
- * @return Audio source module
- */
-struct ausrc *ausrc_get(struct ausrc_st *st)
-{
-	return st ? (struct ausrc *)st->as : NULL;
+	return as->alloch(stp, as, prm, device, rh, errh, arg);
 }

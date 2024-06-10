@@ -1,13 +1,13 @@
 /**
  * @file avformat/audio.c  libavformat media-source -- audio
  *
- * Copyright (C) 2010 - 2020 Creytiv.com
+ * Copyright (C) 2010 - 2020 Alfred E. Heggestad
  */
 
+#include <re_atomic.h>
 #include <re.h>
 #include <rem.h>
 #include <baresip.h>
-#include <pthread.h>
 #include <libavutil/opt.h>
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
@@ -16,8 +16,6 @@
 
 
 struct ausrc_st {
-	const struct ausrc *as;  /* base class */
-
 	struct shared *shared;
 	struct ausrc_prm prm;
 	SwrContext *swr;
@@ -51,7 +49,6 @@ static enum AVSampleFormat aufmt_to_avsampleformat(enum aufmt fmt)
 
 
 int avformat_audio_alloc(struct ausrc_st **stp, const struct ausrc *as,
-			 struct media_ctx **ctx,
 			 struct ausrc_prm *prm, const char *dev,
 			 ausrc_read_h *readh, ausrc_error_h *errh, void *arg)
 {
@@ -68,23 +65,20 @@ int avformat_audio_alloc(struct ausrc_st **stp, const struct ausrc *as,
 	if (!st)
 		return ENOMEM;
 
-	st->as    = as;
 	st->readh = readh;
 	st->errh  = errh;
 	st->arg   = arg;
 	st->prm   = *prm;
 
-	if (ctx && *ctx && (*ctx)->id && !strcmp((*ctx)->id, "avformat")) {
-		st->shared = mem_ref(*ctx);
+	sh = avformat_shared_lookup(dev);
+	if (sh) {
+		st->shared = mem_ref(sh);
 	}
 	else {
 		err = avformat_shared_alloc(&st->shared, dev,
 					    0.0, NULL, false);
 		if (err)
 			goto out;
-
-		if (ctx)
-			*ctx = (struct media_ctx *)st->shared;
 	}
 
 	sh = st->shared;
@@ -103,8 +97,14 @@ int avformat_audio_alloc(struct ausrc_st **stp, const struct ausrc *as,
 
 	avformat_shared_set_audio(st->shared, st);
 
-	info("avformat: audio: converting %u/%u %s -> %u/%u %s\n",
-	     sh->au.ctx->sample_rate, sh->au.ctx->channels,
+#if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(59, 37, 100)
+	int channels = sh->au.ctx->ch_layout.nb_channels;
+#else
+	int channels = sh->au.ctx->channels;
+#endif
+
+	info("avformat: audio: converting %d/%d %s -> %u/%u %s\n",
+	     sh->au.ctx->sample_rate, channels,
 	     av_get_sample_fmt_name(sh->au.ctx->sample_fmt),
 	     prm->srate, prm->ch, aufmt_name(prm->fmt));
 
@@ -123,17 +123,12 @@ void avformat_audio_decode(struct shared *st, AVPacket *pkt)
 	AVFrame frame;
 	AVFrame frame2;
 	int ret;
-#if LIBAVCODEC_VERSION_INT < AV_VERSION_INT(57, 37, 100)
-	int got_frame;
-#endif
 
 	if (!st || !st->au.ctx)
 		return;
 
 	memset(&frame, 0, sizeof(frame));
 	memset(&frame2, 0, sizeof(frame2));
-
-#if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(57, 37, 100)
 
 	ret = avcodec_send_packet(st->au.ctx, pkt);
 	if (ret < 0)
@@ -143,27 +138,26 @@ void avformat_audio_decode(struct shared *st, AVPacket *pkt)
 	if (ret < 0)
 		return;
 
-#else
-	ret = avcodec_decode_audio4(st->au.ctx, &frame, &got_frame, pkt);
-	if (ret < 0 || !got_frame)
-		return;
-#endif
-
 	/* NOTE: pass timestamp to application */
 
-	lock_read_get(st->lock);
+	mtx_lock(&st->lock);
 
 	if (st->ausrc_st && st->ausrc_st->readh) {
 
 		const AVRational tb = st->au.time_base;
 		struct auframe af;
+		int channels = st->ausrc_st->prm.ch;
 
+#if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(59, 37, 100)
+		av_channel_layout_default(&frame2.ch_layout, channels);
+#else
 		frame.channel_layout =
 			av_get_default_channel_layout(frame.channels);
 
-		frame2.channels       = st->ausrc_st->prm.ch;
+		frame2.channels       = channels;
 		frame2.channel_layout =
 			av_get_default_channel_layout(st->ausrc_st->prm.ch);
+#endif
 		frame2.sample_rate    = st->ausrc_st->prm.srate;
 		frame2.format         =
 			aufmt_to_avsampleformat(st->ausrc_st->prm.fmt);
@@ -176,14 +170,15 @@ void avformat_audio_decode(struct shared *st, AVPacket *pkt)
 		}
 
 		auframe_init(&af, st->ausrc_st->prm.fmt, frame2.data[0],
-			     frame2.nb_samples * frame2.channels);
+			     frame2.nb_samples * channels,
+			     st->ausrc_st->prm.srate, st->ausrc_st->prm.ch);
 		af.timestamp = frame.pts * AUDIO_TIMEBASE * tb.num / tb.den;
 
 		st->ausrc_st->readh(&af, st->ausrc_st->arg);
 	}
 
  unlock:
-	lock_rel(st->lock);
+	mtx_unlock(&st->lock);
 
 	av_frame_unref(&frame2);
 	av_frame_unref(&frame);

@@ -1,7 +1,7 @@
 /**
  * @file aac.c MPEG-4 AAC Audio Codec
  *
- * Copyright (C) 2010 Creytiv.com
+ * Copyright (C) 2010 Alfred E. Heggestad
  * Copyright (C) 2019 Hessischer Rundfunk
  */
 
@@ -70,7 +70,7 @@ static struct aucodec aac = {
 	.fmtp_ench = aac_fmtp_enc,
 	.fmtp_cmph = aac_fmtp_cmp,
 /* try to make sure PCM audio buffer is always <= 120 samples */
-	.ptime     = 2,      /* 96 samples per channel @ 48000 hz */
+	.ptime     = 4,      /* 96 samples per channel @ 48000 hz */
 };
 
 

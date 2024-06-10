@@ -1,7 +1,7 @@
 /**
  * @file jack_play.c  JACK audio driver -- player
  *
- * Copyright (C) 2010 Creytiv.com
+ * Copyright (C) 2010 Alfred E. Heggestad
  */
 #include <re.h>
 #include <rem.h>
@@ -11,17 +11,21 @@
 
 
 struct auplay_st {
-	const struct auplay *ap;  /* pointer to base-class (inheritance) */
-
 	struct auplay_prm prm;
 	float *sampv;
 	size_t sampc;             /* includes number of channels */
 	auplay_write_h *wh;
 	void *arg;
+	const char *device;
 
 	jack_client_t *client;
 	jack_port_t **portv;
 	jack_nframes_t nframes;       /* num frames per port (channel) */
+
+	struct auresamp *resamp;
+	int16_t *sampv_lin;
+	int16_t *sampv_rs;
+	size_t extra;	/* number of extra samples at beginning of sampv_lin */
 };
 
 
@@ -38,15 +42,100 @@ struct auplay_st {
 static int process_handler(jack_nframes_t nframes, void *arg)
 {
 	struct auplay_st *st = arg;
+	struct auframe af;
 	size_t sampc = nframes * st->prm.ch;
 	size_t ch, j;
+	int err;
 
-	/* 1. read data from app (signed 16-bit) interleaved */
-	st->wh(st->sampv, sampc, st->arg);
+	if (st->prm.fmt == AUFMT_S16LE) {
+		size_t sampc_rs_out = 0;
 
-	/* 2. convert from 16-bit to float and copy to Jack */
+		if (st->resamp) {
+			size_t sampc_rs;
 
-	/* 3. de-interleave [LRLRLRLR] -> [LLLLL]+[RRRRR] */
+			if (st->resamp->up) {
+				/* upsampling */
+				sampc_rs = (sampc / st->prm.ch) /
+					st->resamp->ratio;
+
+				if (sampc_rs * st->prm.ch * st->resamp->ratio
+					+ st->extra < sampc) {
+
+					/* need to read one extra sample
+						per channel */
+					++sampc_rs;
+				}
+				sampc_rs = sampc_rs * st->prm.ch;
+			}
+			else {
+				/* downsampling */
+				sampc_rs = sampc * st->resamp->ratio;
+			}
+
+			if (!st->sampv_rs) {
+				st->sampv_rs = mem_alloc(sampc_rs *
+					sizeof(int16_t), NULL);
+
+				if (!st->sampv_rs) {
+
+					warning("jack: could not "
+						"alloc memory\n");
+					return 0;
+				}
+			}
+
+			auframe_init(&af, st->prm.fmt, st->sampv_rs, sampc_rs,
+				     st->prm.srate, st->prm.ch);
+
+			/* 1. read data from app (signed 16-bit) interleaved,
+				other sample rate */
+			st->wh(&af, st->arg);
+
+			/* resample */
+			err = auresamp(st->resamp,
+				st->sampv_lin + st->extra, &sampc_rs_out,
+				st->sampv_rs, sampc_rs);
+
+			if (err) {
+				info("jack: auresamp err: %d\n", err);
+				return 0;
+			}
+		}
+		else {
+			/* 1. read data from app (signed 16-bit) interleaved,
+				same sample rate */
+			auframe_init(&af, st->prm.fmt, st->sampv_lin, sampc,
+				     st->prm.srate, st->prm.ch);
+			st->wh(&af, st->arg);
+		}
+
+		/* convert from 16-bit to float */
+		auconv_from_s16(AUFMT_FLOAT, st->sampv, st->sampv_lin, sampc);
+
+		if (st->resamp && st->resamp->up &&
+			sampc_rs_out + st->extra >= sampc) {
+			/* this code is only for upsampling where there are
+				extra bytes left over,
+				byte offset is saved in st->extra */
+			size_t diff = sampc_rs_out + st->extra - sampc;
+
+			/* move remaining samples to start of sampv_lin buffer
+				to be used next callback */
+			for (size_t i=0;i<diff;i++) {
+				st->sampv_lin[i] = st->sampv_lin[sampc+i];
+			}
+
+			st->extra = diff;
+		}
+	}
+	else {
+		/* 1. read data from app (floats) interleaved */
+		auframe_init(&af, st->prm.fmt, st->sampv, sampc, st->prm.srate,
+			     st->prm.ch);
+		st->wh(&af, st->arg);
+	}
+
+	/* de-interleave floats [LRLRLRLR] -> [LLLLL]+[RRRRR] */
 	for (ch = 0; ch < st->prm.ch; ch++) {
 
 		jack_default_audio_sample_t *buffer;
@@ -74,7 +163,11 @@ static void auplay_destructor(void *arg)
 
 	mem_deref(st->sampv);
 	mem_deref(st->portv);
+	mem_deref(st->resamp);
+	mem_deref(st->sampv_rs);
+	mem_deref(st->sampv_lin);
 }
+
 
 static int start_jack(struct auplay_st *st)
 {
@@ -82,18 +175,20 @@ static int start_jack(struct auplay_st *st)
 	const char **ports;
 	const char *client_name = "baresip";
 	const char *server_name = NULL;
+	char *conf_name;
 	jack_options_t options = JackNullOption;
 	jack_status_t status;
 	unsigned ch;
 	jack_nframes_t engine_srate;
+	size_t len;
 
 	bool jack_connect_ports = true;
 	(void)conf_get_bool(conf, "jack_connect_ports",
 				  &jack_connect_ports);
 
 	/* open a client connection to the JACK server */
-	size_t len = jack_client_name_size();
-	char *conf_name = mem_alloc(len+1, NULL);
+	len = jack_client_name_size();
+	conf_name = mem_alloc(len+1, NULL);
 
 	if (!conf_get_str(conf, "jack_client_name",
 			conf_name, len)) {
@@ -130,10 +225,67 @@ static int start_jack(struct auplay_st *st)
 	     engine_srate, st->nframes);
 
 	/* currently the application must use the same sample-rate
-	   as the jack server backend */
+	   as the jack server backend for floats;
+	   for s16le we can do resampling and convert to floats */
 	if (engine_srate != st->prm.srate) {
-		warning("jack: samplerate %uHz expected\n", engine_srate);
-		return EINVAL;
+		if (st->prm.fmt == AUFMT_S16LE) {
+			int err;
+
+			info("jack: enable resampler:"
+					" %uHz/%uch --> %uHz/%uch\n",
+	    			st->prm.srate, st->prm.ch,
+					engine_srate, st->prm.ch);
+
+			st->resamp = mem_alloc(sizeof(*st->resamp), NULL);
+			if (!st->resamp)
+				return ENOMEM;
+
+			auresamp_init(st->resamp);
+			err = auresamp_setup(st->resamp,
+                                     st->prm.srate, st->prm.ch,
+                                     engine_srate, st->prm.ch);
+
+			if (err) {
+				warning("jack: could not setup resampler"
+                        	        " (%m)\n", err);
+				return EINVAL;
+			}
+
+			st->extra = 0;
+
+		}
+		else {
+			warning("jack: samplerate %uHz expected\n",
+				engine_srate);
+			return EINVAL;
+		}
+	}
+
+	if (st->prm.fmt == AUFMT_S16LE) {
+		if (st->resamp) {
+			if (!st->resamp->up) {
+				/* for downsampling we need *
+					ratio for fir_filter, see auresamp */
+				st->sampv_lin = mem_alloc(st->nframes *
+				st->prm.ch * sizeof(int16_t) *
+				st->resamp->ratio, NULL);
+			}
+			else {
+				/* for upsampling we need space for
+					1 extra resampled sample per channel */
+				st->sampv_lin = mem_alloc(
+					(st->nframes + st->resamp->ratio)
+				 	* st->prm.ch * sizeof(int16_t), NULL);
+			}
+		}
+		else {
+			/* same sample rate, straight alloc */
+			st->sampv_lin = mem_alloc(st->nframes *
+			st->prm.ch * sizeof(int16_t), NULL);
+		}
+
+		if (!st->sampv_lin)
+			return ENOMEM;
 	}
 
 	st->sampc = st->nframes * st->prm.ch;
@@ -173,24 +325,40 @@ static int start_jack(struct auplay_st *st)
 	 */
 
 	if (jack_connect_ports) {
-		info("jack: connecting default input ports\n");
-		ports = jack_get_ports (st->client, NULL, NULL,
-					JackPortIsInput | JackPortIsPhysical);
+
+		unsigned i;
+
+		/* If device is specified, get the ports matching the
+		 * regexp specified in the device string. Otherwise, get all
+		 * physical ports. */
+
+		if (st->device) {
+			info("jack: connect input ports matching regexp %s\n",
+				st->device);
+			ports = jack_get_ports (st->client, st->device, NULL,
+				JackPortIsInput);
+		}
+		else {
+			info("jack: connect physical input ports\n");
+			ports = jack_get_ports (st->client, NULL, NULL,
+				JackPortIsInput | JackPortIsPhysical);
+		}
+
 		if (ports == NULL) {
-			warning("jack: no physical playback ports\n");
+			warning("jack: no input ports found\n");
 			return ENODEV;
 		}
 
-		/* Connect all physical ports. In case of for example mono
-		 * audio with 2 physical playback ports, connect the
-		 * single registered port to both physical port.
+		/* Connect all ports. In case of for example mono audio with
+		 * 2 jack input ports, connect the single registered port to
+		 * both input port.
 		 */
 		ch = 0;
-		for (unsigned i = 0; ports[i] != NULL; i++) {
+		for (i = 0; ports[i] != NULL; i++) {
 			if (jack_connect (st->client,
 					jack_port_name (st->portv[ch]),
 						ports[i])) {
-				warning("jack: cannot connect output ports\n");
+				warning("jack: cannot connect input ports\n");
 			}
 
 			++ch;
@@ -213,17 +381,23 @@ int jack_play_alloc(struct auplay_st **stp, const struct auplay *ap,
 	struct auplay_st *st;
 	int err = 0;
 
-	(void)device;
-
 	if (!stp || !ap || !prm || !wh)
 		return EINVAL;
 
 	info("jack: play %uHz,%uch\n", prm->srate, prm->ch);
 
 	if (prm->fmt != AUFMT_FLOAT) {
-		warning("jack: playback: unsupported sample format (%s)\n",
-			aufmt_name(prm->fmt));
-		return ENOTSUP;
+		if (prm->fmt == AUFMT_S16LE) {
+			info("jack: NOTE: source sample conversion"
+				" needed: %s  -->  %s\n",
+				aufmt_name(prm->fmt), aufmt_name(AUFMT_FLOAT));
+		}
+		else {
+			warning("jack: playback: unsupported "
+				"sample format (%s)\n",
+				aufmt_name(prm->fmt));
+			return ENOTSUP;
+		}
 	}
 
 	st = mem_zalloc(sizeof(*st), auplay_destructor);
@@ -231,9 +405,11 @@ int jack_play_alloc(struct auplay_st **stp, const struct auplay *ap,
 		return ENOMEM;
 
 	st->prm = *prm;
-	st->ap  = ap;
 	st->wh  = wh;
 	st->arg = arg;
+
+	if (str_isset(device))
+		st->device = device;
 
 	st->portv = mem_reallocarray(NULL, prm->ch, sizeof(*st->portv), NULL);
 	if (!st->portv) {

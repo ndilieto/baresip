@@ -1,7 +1,7 @@
 /**
  * @file alsa_src.c  ALSA sound driver - recorder
  *
- * Copyright (C) 2010 Creytiv.com
+ * Copyright (C) 2010 Alfred E. Heggestad
  */
 #define _DEFAULT_SOURCE 1
 #define _POSIX_SOURCE 1
@@ -10,7 +10,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <alsa/asoundlib.h>
-#include <pthread.h>
+#include <re_atomic.h>
 #include <re.h>
 #include <rem.h>
 #include <baresip.h>
@@ -18,9 +18,8 @@
 
 
 struct ausrc_st {
-	const struct ausrc *as;  /* pointer to base-class (inheritance) */
-	pthread_t thread;
-	volatile bool run;
+	thrd_t thread;
+	RE_ATOMIC bool run;
 	snd_pcm_t *read;
 	void *sampv;
 	size_t sampc;
@@ -36,10 +35,10 @@ static void ausrc_destructor(void *arg)
 	struct ausrc_st *st = arg;
 
 	/* Wait for termination of other thread */
-	if (st->run) {
+	if (re_atomic_rlx(&st->run)) {
 		debug("alsa: stopping recording thread (%s)\n", st->device);
-		st->run = false;
-		(void)pthread_join(st->thread, NULL);
+		re_atomic_rlx_set(&st->run, false);
+		thrd_join(st->thread, NULL);
 	}
 
 	if (st->read)
@@ -50,7 +49,7 @@ static void ausrc_destructor(void *arg)
 }
 
 
-static void *read_thread(void *arg)
+static int read_thread(void *arg)
 {
 	struct ausrc_st *st = arg;
 	uint64_t frames = 0;
@@ -67,7 +66,7 @@ static void *read_thread(void *arg)
 		goto out;
 	}
 
-	while (st->run) {
+	while (re_atomic_rlx(&st->run)) {
 		struct auframe af;
 		long n;
 
@@ -80,9 +79,8 @@ static void *read_thread(void *arg)
 			continue;
 		}
 
-		af.fmt   = st->prm.fmt;
-		af.sampv = st->sampv;
-		af.sampc = n * st->prm.ch;
+		auframe_init(&af, st->prm.fmt, st->sampv, n * st->prm.ch,
+			     st->prm.srate, st->prm.ch);
 		af.timestamp = frames * AUDIO_TIMEBASE / st->prm.srate;
 
 		frames += n;
@@ -91,12 +89,11 @@ static void *read_thread(void *arg)
 	}
 
  out:
-	return NULL;
+	return err;
 }
 
 
 int alsa_src_alloc(struct ausrc_st **stp, const struct ausrc *as,
-		   struct media_ctx **ctx,
 		   struct ausrc_prm *prm, const char *device,
 		   ausrc_read_h *rh, ausrc_error_h *errh, void *arg)
 {
@@ -104,7 +101,6 @@ int alsa_src_alloc(struct ausrc_st **stp, const struct ausrc *as,
 	snd_pcm_format_t pcmfmt;
 	int num_frames;
 	int err;
-	(void)ctx;
 	(void)errh;
 
 	if (!stp || !as || !prm || !rh)
@@ -122,7 +118,6 @@ int alsa_src_alloc(struct ausrc_st **stp, const struct ausrc *as,
 		goto out;
 
 	st->prm = *prm;
-	st->as  = as;
 	st->rh  = rh;
 	st->arg = arg;
 
@@ -158,10 +153,10 @@ int alsa_src_alloc(struct ausrc_st **stp, const struct ausrc *as,
 		goto out;
 	}
 
-	st->run = true;
-	err = pthread_create(&st->thread, NULL, read_thread, st);
+	re_atomic_rlx_set(&st->run, true);
+	err = thread_create_name(&st->thread, "alsa_src", read_thread, st);
 	if (err) {
-		st->run = false;
+		re_atomic_rlx_set(&st->run, false);
 		goto out;
 	}
 

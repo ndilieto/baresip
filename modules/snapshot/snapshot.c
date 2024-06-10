@@ -1,7 +1,7 @@
 /**
  * @file snapshot.c  Snapshot Video-Filter
  *
- * Copyright (C) 2010 Creytiv.com
+ * Copyright (C) 2010 Alfred E. Heggestad
  */
 #include <string.h>
 #include <re.h>
@@ -90,10 +90,11 @@ static int do_snapshot(struct re_printf *pf, void *arg)
 	return 0;
 }
 
+
 static int do_snapshot_recv(struct re_printf *pf, void *arg)
 {
-	(void)pf;
 	const struct cmd_arg *carg = arg;
+	(void)pf;
 
 	if (flag_dec)
 		return 0;
@@ -105,10 +106,11 @@ static int do_snapshot_recv(struct re_printf *pf, void *arg)
 	return 0;
 }
 
+
 static int do_snapshot_send(struct re_printf *pf, void *arg)
 {
-	(void)pf;
 	const struct cmd_arg *carg = arg;
+	(void)pf;
 
 	if (flag_enc)
 		return 0;
@@ -141,7 +143,7 @@ static const struct cmd cmdv[] = {
 static int module_init(void)
 {
 	vidfilt_register(baresip_vidfiltl(), &snapshot);
-	return cmd_register(baresip_commands(), cmdv, ARRAY_SIZE(cmdv));
+	return cmd_register(baresip_commands(), cmdv, RE_ARRAY_SIZE(cmdv));
 }
 
 

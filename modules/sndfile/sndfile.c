@@ -1,7 +1,7 @@
 /**
  * @file sndfile.c  Audio dumper using libsndfile
  *
- * Copyright (C) 2010 Creytiv.com
+ * Copyright (C) 2010 Alfred E. Heggestad
  */
 #include <sndfile.h>
 #include <time.h>
@@ -17,24 +17,26 @@
  *
  * Example Configuration:
  \verbatim
-  snd_path 					/tmp/
+  snd_path					/tmp/
  \endverbatim
  */
 
 
 struct sndfile_enc {
 	struct aufilt_enc_st af;  /* base class */
-	SNDFILE *enc;
-	enum aufmt fmt;
+	SNDFILE *encf;
+	int err;
+	const struct audio *audio;
 };
 
 struct sndfile_dec {
 	struct aufilt_dec_st af;  /* base class */
-	SNDFILE *dec;
-	enum aufmt fmt;
+	SNDFILE *decf;
+	int err;
+	const struct audio *audio;
 };
 
-static char file_path[256] = ".";
+static char file_path[512] = ".";
 
 
 static int timestamp_print(struct re_printf *pf, const struct tm *tm)
@@ -52,8 +54,8 @@ static void enc_destructor(void *arg)
 {
 	struct sndfile_enc *st = arg;
 
-	if (st->enc)
-		sf_close(st->enc);
+	if (st->encf)
+		sf_close(st->encf);
 
 	list_unlink(&st->af.le);
 }
@@ -63,8 +65,8 @@ static void dec_destructor(void *arg)
 {
 	struct sndfile_dec *st = arg;
 
-	if (st->dec)
-		sf_close(st->dec);
+	if (st->decf)
+		sf_close(st->decf);
 
 	list_unlink(&st->af.le);
 }
@@ -81,25 +83,32 @@ static int get_format(enum aufmt fmt)
 }
 
 
-static SNDFILE *openfile(const struct aufilt_prm *prm, bool enc)
+static int openfile(SNDFILE **sfp,
+			 const struct aufilt_prm *prm,
+			 const struct stream *strm,
+			 bool enc)
 {
-	char filename[128];
+	char filename[256];
 	SF_INFO sfinfo;
 	time_t tnow = time(0);
 	struct tm *tm = localtime(&tnow);
 	SNDFILE *sf;
 	int format;
 
+	const char *cname = stream_cname(strm);
+	const char *peer = stream_peer(strm);
+
 	(void)re_snprintf(filename, sizeof(filename),
-			  "%s/dump-%H-%s.wav",
-				file_path,
+			  "%s/dump-%s=>%s-%H-%s.wav",
+			  file_path,
+			  cname, peer,
 			  timestamp_print, tm, enc ? "enc" : "dec");
 
 	format = get_format(prm->fmt);
 	if (!format) {
 		warning("sndfile: sample format not supported (%s)\n",
 			aufmt_name(prm->fmt));
-		return NULL;
+		return EINVAL;
 	}
 
 	sfinfo.samplerate = prm->srate;
@@ -110,13 +119,20 @@ static SNDFILE *openfile(const struct aufilt_prm *prm, bool enc)
 	if (!sf) {
 		warning("sndfile: could not open: %s\n", filename);
 		puts(sf_strerror(NULL));
-		return NULL;
+		return EIO;
 	}
 
 	info("sndfile: dumping %s audio to %s\n",
 	     enc ? "encode" : "decode", filename);
 
-	return sf;
+	module_event("sndfile", "dump", NULL, NULL,
+		     "%s/dump-%s=>%s-%H-%s.wav",
+		     file_path,
+		     cname, peer,
+		     timestamp_print, tm, enc ? "enc" : "dec");
+
+	*sfp = sf;
+	return 0;
 }
 
 
@@ -125,30 +141,21 @@ static int encode_update(struct aufilt_enc_st **stp, void **ctx,
 			 const struct audio *au)
 {
 	struct sndfile_enc *st;
-	int err = 0;
 	(void)ctx;
 	(void)af;
-	(void)au;
+	(void)prm;
 
-	if (!stp || !prm)
+	if (!stp || !au)
 		return EINVAL;
 
 	st = mem_zalloc(sizeof(*st), enc_destructor);
 	if (!st)
 		return EINVAL;
 
-	st->fmt = prm->fmt;
+	st->audio = au;
+	*stp = (struct aufilt_enc_st *)st;
 
-	st->enc = openfile(prm, true);
-	if (!st->enc)
-		err = ENOMEM;
-
-	if (err)
-		mem_deref(st);
-	else
-		*stp = (struct aufilt_enc_st *)st;
-
-	return err;
+	return 0;
 }
 
 
@@ -157,30 +164,21 @@ static int decode_update(struct aufilt_dec_st **stp, void **ctx,
 			 const struct audio *au)
 {
 	struct sndfile_dec *st;
-	int err = 0;
 	(void)ctx;
 	(void)af;
-	(void)au;
+	(void)prm;
 
-	if (!stp || !prm)
+	if (!stp || !au)
 		return EINVAL;
 
 	st = mem_zalloc(sizeof(*st), dec_destructor);
 	if (!st)
 		return EINVAL;
 
-	st->fmt = prm->fmt;
+	st->audio = au;
+	*stp = (struct aufilt_dec_st *)st;
 
-	st->dec = openfile(prm, false);
-	if (!st->dec)
-		err = ENOMEM;
-
-	if (err)
-		mem_deref(st);
-	else
-		*stp = (struct aufilt_dec_st *)st;
-
-	return err;
+	return 0;
 }
 
 
@@ -192,9 +190,20 @@ static int encode(struct aufilt_enc_st *st, struct auframe *af)
 	if (!st || !af)
 		return EINVAL;
 
-	num_bytes = af->sampc * aufmt_sample_size(sf->fmt);
+	if (sf->err)
+		return sf->err;
 
-	sf_write_raw(sf->enc, af->sampv, num_bytes);
+	if (!sf->encf) {
+		struct aufilt_prm prm = {af->srate, af->ch, af->fmt};
+		sf->err = openfile(&sf->encf, &prm,
+				   audio_strm(sf->audio), true);
+		if (sf->err)
+			return sf->err;
+	}
+
+	num_bytes = auframe_size(af);
+
+	sf_write_raw(sf->encf, af->sampv, num_bytes);
 
 	return 0;
 }
@@ -208,9 +217,20 @@ static int decode(struct aufilt_dec_st *st, struct auframe *af)
 	if (!st || !af)
 		return EINVAL;
 
-	num_bytes = af->sampc * aufmt_sample_size(sf->fmt);
+	if (sf->err)
+		return sf->err;
 
-	sf_write_raw(sf->dec, af->sampv, num_bytes);
+	if (!sf->decf) {
+		struct aufilt_prm prm = {af->srate, af->ch, af->fmt};
+		sf->err = openfile(&sf->decf, &prm,
+				   audio_strm(sf->audio), false);
+		if (sf->err)
+			return sf->err;
+	}
+
+	num_bytes = auframe_size(af);
+
+	sf_write_raw(sf->decf, af->sampv, num_bytes);
 
 	return 0;
 }

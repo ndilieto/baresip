@@ -1,15 +1,12 @@
 /**
  * @file decode.cpp  WebRTC Acoustic Echo Cancellation (AEC) -- Decode
  *
- * Copyright (C) 2010 Creytiv.com
+ * Copyright (C) 2010 Alfred E. Heggestad
  */
 
 #include <re.h>
 #include <rem.h>
 #include <baresip.h>
-#ifdef HAVE_PTHREAD
-#include <pthread.h>
-#endif
 #include "aec.h"
 
 
@@ -17,7 +14,6 @@ struct aec_dec {
 	struct aufilt_dec_st af;  /* inheritance */
 
 	struct aec *aec;
-	enum aufmt fmt;
 };
 
 
@@ -59,8 +55,6 @@ int webrtc_aec_decode_update(struct aufilt_dec_st **stp, void **ctx,
 	if (!st)
 		return ENOMEM;
 
-	st->fmt = (enum aufmt)prm->fmt;
-
 	err = webrtc_aec_alloc(&st->aec, ctx, prm);
 	if (err)
 		goto out;
@@ -75,22 +69,28 @@ int webrtc_aec_decode_update(struct aufilt_dec_st **stp, void **ctx,
 }
 
 
-static int decode_float(struct aec_dec *dec, const float *sampv, size_t sampc)
+static int decode_float(struct aec_dec *dec, float *sampv, size_t sampc)
 {
 	struct aec *aec = dec->aec;
-	const float *farend = (const float *)sampv;
+	webrtc::StreamConfig config(aec->srate, aec->ch, false);
 	size_t i;
 	int r;
 	int err = 0;
 
-	pthread_mutex_lock(&aec->mutex);
+	if (sampc % aec->blocksize)
+		return EINVAL;
 
-	for (i = 0; i < sampc; i += aec->subframe_len) {
+	mtx_lock(&aec->mutex);
 
-		r = WebRtcAec_BufferFarend(aec->inst, farend + i,
-					   aec->subframe_len);
+	for (i = 0; i < sampc; i += aec->blocksize) {
+
+		const float *src = &sampv[i];
+		float *dest = &sampv[i];
+
+		r = aec->inst->ProcessReverseStream(&src, config, config,
+						    &dest);
 		if (r != 0) {
-			warning("webrtc_aec: decode: WebRtcAec_BufferFarend"
+			warning("webrtc_aec: decode: ProcessReverseStream"
 				" error (%d)\n", r);
 			err = EPROTO;
 			goto out;
@@ -98,7 +98,7 @@ static int decode_float(struct aec_dec *dec, const float *sampv, size_t sampc)
 	}
 
  out:
-	pthread_mutex_unlock(&aec->mutex);
+	mtx_unlock(&aec->mutex);
 
 	return err;
 }
@@ -114,7 +114,7 @@ int webrtc_aec_decode(struct aufilt_dec_st *st, struct auframe *af)
 		return EINVAL;
 
 	/* convert samples to float if needed */
-	switch (dec->fmt) {
+	switch (af->fmt) {
 
 	case AUFMT_S16LE:
 		flt = (float *)mem_alloc(af->sampc * sizeof(float), NULL);

@@ -1,7 +1,7 @@
 /**
  * @file src/module.c Module loading
  *
- * Copyright (C) 2010 Creytiv.com
+ * Copyright (C) 2010 Alfred E. Heggestad
  */
 #include <re.h>
 #include <baresip.h>
@@ -107,15 +107,6 @@ static int module_handler(const struct pl *val, void *arg)
 }
 
 
-static int module_tmp_handler(const struct pl *val, void *arg)
-{
-	struct mod *mod = NULL;
-	(void)load_module(&mod, arg, val);
-	mem_deref(mod);
-	return 0;
-}
-
-
 static int module_app_handler(const struct pl *val, void *arg)
 {
 	struct mod *mod = NULL;
@@ -149,10 +140,6 @@ int module_init(const struct conf *conf)
 		pl_set_str(&path, ".");
 
 	err = conf_apply(conf, "module", module_handler, &path);
-	if (err)
-		return err;
-
-	err = conf_apply(conf, "module_tmp", module_tmp_handler, &path);
 	if (err)
 		return err;
 

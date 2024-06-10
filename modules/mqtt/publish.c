@@ -1,7 +1,7 @@
 /**
  * @file publish.c MQTT client -- publish
  *
- * Copyright (C) 2017 Creytiv.com
+ * Copyright (C) 2017 Alfred E. Heggestad
  */
 
 #include <mosquitto.h>
@@ -100,7 +100,7 @@ int mqtt_publish_init(struct mqtt *mqtt)
 	if (err)
 		return err;
 
-	return err;
+	return 0;
 }
 
 

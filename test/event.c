@@ -1,7 +1,7 @@
 /**
  * @file test/event.c  Baresip selftest -- event handling
  *
- * Copyright (C) 2010 Creytiv.com
+ * Copyright (C) 2010 Alfred E. Heggestad
  */
 #include <string.h>
 #include <re.h>
@@ -25,7 +25,7 @@ int test_event(void)
 		/* .. more events .. */
 	};
 
-	for (i=0; i<ARRAY_SIZE(eventv); i++) {
+	for (i=0; i<RE_ARRAY_SIZE(eventv); i++) {
 
 		const enum ua_event ev = eventv[i];
 		const struct odict_entry *entry;
@@ -42,8 +42,8 @@ int test_event(void)
 		/* verify the mandatory entries */
 		entry = odict_lookup(od, "type");
 		ASSERT_TRUE(entry != NULL);
-		ASSERT_EQ(ODICT_STRING, entry->type);
-		ASSERT_STREQ(uag_event_str(ev), entry->u.str);
+		ASSERT_EQ(ODICT_STRING, odict_entry_type(entry));
+		ASSERT_STREQ(uag_event_str(ev), odict_entry_str(entry));
 
 		od = mem_deref(od);
 	}

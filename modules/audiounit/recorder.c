@@ -1,12 +1,11 @@
 /**
  * @file audiounit/recorder.c  AudioUnit input recorder
  *
- * Copyright (C) 2010 Creytiv.com
+ * Copyright (C) 2010 Alfred E. Heggestad
  */
 #include <AudioUnit/AudioUnit.h>
 #include <AudioToolbox/AudioToolbox.h>
 #include <TargetConditionals.h>
-#include <pthread.h>
 #include <re.h>
 #include <rem.h>
 #include <baresip.h>
@@ -14,11 +13,10 @@
 
 
 struct ausrc_st {
-	const struct ausrc *as;      /* inheritance */
 	struct audiosess_st *sess;
 	AudioUnit au_in;
 	AudioUnit au_conv;
-	pthread_mutex_t mutex;
+	mtx_t mutex;
 	struct ausrc_prm prm;
 	int ch;
 	uint32_t sampsz;
@@ -35,9 +33,9 @@ static void ausrc_destructor(void *arg)
 {
 	struct ausrc_st *st = arg;
 
-	pthread_mutex_lock(&st->mutex);
+	mtx_lock(&st->mutex);
 	st->rh = NULL;
-	pthread_mutex_unlock(&st->mutex);
+	mtx_unlock(&st->mutex);
 
 	AudioOutputUnitStop(st->au_in);
 	AudioUnitUninitialize(st->au_in);
@@ -50,7 +48,7 @@ static void ausrc_destructor(void *arg)
 	mem_deref(st->sess);
 	mem_deref(st->buf);
 
-	pthread_mutex_destroy(&st->mutex);
+	mtx_destroy(&st->mutex);
 }
 
 
@@ -72,10 +70,10 @@ static OSStatus input_callback(void *inRefCon,
 
 	(void)ioData;
 
-	pthread_mutex_lock(&st->mutex);
+	mtx_lock(&st->mutex);
 	rh  = st->rh;
 	arg = st->arg;
-	pthread_mutex_unlock(&st->mutex);
+	mtx_unlock(&st->mutex);
 
 	if (!rh)
 		return 0;
@@ -112,7 +110,7 @@ static OSStatus input_callback(void *inRefCon,
 		if (err)
 			return kAudioUnitErr_InvalidParameter;
 
-		/* Maximun number of resampled frames which can be delivered
+		/* Maximum number of resampled frames which can be delivered
 		   by the converter */
 		nb_frames_max = nb_frames * st->sampc_ratio;
 		if (inNumberFrames > nb_frames_max)
@@ -137,9 +135,9 @@ static OSStatus input_callback(void *inRefCon,
 		ts  = AUDIO_TIMEBASE*inTimeStamp->mSampleTime / st->prm.srate;
 		ts *= st->sampc_ratio;
 
-		af.fmt   = st->fmt;
-		af.sampv = abl_conv.mBuffers[0].mData;
-		af.sampc = abl_conv.mBuffers[0].mDataByteSize/st->sampsz;
+		auframe_init(&af, st->prm.fmt, abl_conv.mBuffers[0].mData,
+			     abl_conv.mBuffers[0].mDataByteSize / st->sampsz,
+			     st->prm.srate, st->prm.ch);
 		af.timestamp = ts;
 
 		rh(&af, arg);
@@ -183,7 +181,6 @@ static void interrupt_handler(bool interrupted, void *arg)
 
 
 int audiounit_recorder_alloc(struct ausrc_st **stp, const struct ausrc *as,
-			     struct media_ctx **ctx,
 			     struct ausrc_prm *prm, const char *device,
 			     ausrc_read_h *rh, ausrc_error_h *errh, void *arg)
 {
@@ -201,7 +198,7 @@ int audiounit_recorder_alloc(struct ausrc_st **stp, const struct ausrc *as,
 	AudioObjectPropertyAddress auAddress = {
 		kAudioHardwarePropertyDefaultInputDevice,
 		kAudioObjectPropertyScopeGlobal,
-		kAudioObjectPropertyElementMaster };
+		kAudioObjectPropertyElementMain };
 #endif
 	Float64 hw_srate = 0.0;
 	UInt32 hw_size = sizeof(hw_srate);
@@ -209,7 +206,6 @@ int audiounit_recorder_alloc(struct ausrc_st **stp, const struct ausrc *as,
 	OSStatus ret = 0;
 	int err;
 
-	(void)ctx;
 	(void)device;
 	(void)errh;
 
@@ -220,7 +216,6 @@ int audiounit_recorder_alloc(struct ausrc_st **stp, const struct ausrc *as,
 	if (!st)
 		return ENOMEM;
 
-	st->as  = as;
 	st->rh  = rh;
 	st->arg = arg;
 	st->ch  = prm->ch;
@@ -238,9 +233,11 @@ int audiounit_recorder_alloc(struct ausrc_st **stp, const struct ausrc *as,
 	if (err)
 		goto out;
 
-	err = pthread_mutex_init(&st->mutex, NULL);
-	if (err)
+	err = mtx_init(&st->mutex, mtx_plain) != thrd_success;
+	if (err) {
+		err = ENOMEM;
 		goto out;
+	}
 
 	err = audiosess_alloc(&st->sess, interrupt_handler, st);
 	if (err)
